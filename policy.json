@@ -1,0 +1,52 @@
+[
+  {
+    "key": "environment",
+    "value": [
+      "production",
+      "staging",
+      "dev"
+    ],
+    "status": "include",
+    "mandatory": true
+  },
+  {
+    "key": "owner",
+    "status": "include",
+    "mandatory": true
+  },
+  {
+    "key": "system",
+    "status": "include",
+    "mandatory": false
+  },
+  {
+    "key": "budget-code",
+    "status": "include",
+    "mandatory": true
+  },
+  {
+    "key": "managed-by",
+    "value": [
+      "terraform",
+      "manual",
+      "cloudformation",
+      "cdk",
+      "other"
+    ],
+    "status": "include",
+    "mandatory": false
+  },
+  {
+    "key": "cloud-provider",
+    "value": [
+      "aws"
+    ],
+    "status": "include",
+    "mandatory": false
+  },
+  {
+    "key": "service",
+    "status": "include",
+    "mandatory": false
+  }
+]

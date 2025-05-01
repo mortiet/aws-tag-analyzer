@@ -1,0 +1,3 @@
+package ai
+
+// ... any other functions specific to client.go remain here ...
