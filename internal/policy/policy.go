@@ -9,138 +9,193 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// PolicyRule defines a single rule for a tag.
-type PolicyRule struct {
+// TagRule defines a single rule in the tag policy.
+type TagRule struct {
 	Key       string   `json:"key"`
-	Value     []string `json:"value,omitempty"` // List of allowed values, if restricted
-	Status    string   `json:"status"`          // e.g., "include" (currently only supported value)
-	Mandatory bool     `json:"mandatory"`       // Renamed from 'mandetory'
+	Mandatory bool     `json:"mandatory"`
+	Value     []string `json:"value,omitempty"` // Optional list of allowed values
+	Status    string   `json:"status"`          // "active" or "inactive"
 }
 
-// Policy is now a slice of PolicyRule.
-type Policy []PolicyRule
+// TagPolicy represents the overall tag policy structure.
+type TagPolicy struct {
+	Rules []TagRule `json:"rules"`
+}
 
-// ValidationIssue represents a single tagging policy violation found on a resource.
+// ValidationIssue defines the structure for a tag validation issue.
+// This struct was implicitly used by ValidateResource and is needed here.
 type ValidationIssue struct {
 	IssueType      string            `json:"issue_type"` // e.g., "MissingMandatory", "InvalidValue", "MissingDesirable"
 	TagKey         string            `json:"tag_key"`
-	TagValue       string            `json:"tag_value,omitempty"`      // Current value if relevant (e.g., for InvalidValue)
-	AllowedValues  []string          `json:"allowed_values,omitempty"` // Allowed values from policy if relevant
-	Recommendation map[string]string `json:"recommendation,omitempty"` // Changed from string to map[string]string
+	TagValue       string            `json:"tag_value,omitempty"`      // Included for InvalidValue
+	AllowedValues  []string          `json:"allowed_values,omitempty"` // Included for InvalidValue
+	Recommendation map[string]string `json:"recommendation,omitempty"` // Populated later by AI step
 }
 
-// LoadPolicy loads the tag policy from a JSON file (new structure).
-func LoadPolicy(filePath string) (*Policy, error) {
-	if filePath == "" {
-		log.Info().Msg("No policy file specified. Skipping policy validation.")
-		return nil, nil // No error, just no policy to apply
+// LoadPolicy loads the tag policy from a JSON file.
+// If filename is empty, it returns an empty policy without error.
+func LoadPolicy(filename string) (*TagPolicy, error) {
+	if filename == "" {
+		log.Debug().Msg("No policy file specified, returning empty policy.")
+		// Return a default empty policy if no file is specified
+		return &TagPolicy{Rules: []TagRule{}}, nil // Ensure empty slice, not nil
 	}
 
-	data, err := os.ReadFile(filePath)
+	log.Debug().Str("file", filename).Msg("Loading policy file")
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read policy file '%s': %w", filePath, err)
+		return nil, fmt.Errorf("failed to read policy file %s: %w", filename, err)
 	}
 
-	var pol Policy // Changed to slice
-	err = json.Unmarshal(data, &pol)
+	// Check if the file is empty
+	if len(data) == 0 {
+		log.Warn().Str("file", filename).Msg("Policy file is empty, returning empty policy.")
+		return &TagPolicy{Rules: []TagRule{}}, nil
+	}
+
+	var rules []TagRule // Expecting a JSON array of rule objects directly
+	err = json.Unmarshal(data, &rules)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal policy file '%s': %w", filePath, err)
+		return nil, fmt.Errorf("failed to unmarshal policy JSON from %s (expected JSON array of rules): %w", filename, err)
 	}
 
-	log.Info().Str("path", filePath).Int("rules_loaded", len(pol)).Msg("Successfully loaded tag policy")
-	return &pol, nil
-}
-
-// ValidateResource checks a single resource against the loaded policy (new structure).
-// It assumes tags are already potentially lowercased if the flag was set.
-func ValidateResource(resKind, resName, resRegion string, tags map[string]string, pol *Policy, isLowercase bool) []ValidationIssue {
-	if pol == nil {
-		return nil // No policy to validate against
-	}
-
-	var issues []ValidationIssue
-
-	// Iterate through each rule in the policy
-	for _, rule := range *pol {
-		if rule.Status != "include" { // Only handle "include" status for now
-			log.Warn().Str("key", rule.Key).Str("status", rule.Status).Msg("Unsupported policy status encountered, skipping rule.")
+	// Filter out inactive rules and validate rule structure
+	activeRules := []TagRule{}
+	for i, rule := range rules {
+		if rule.Key == "" {
+			log.Warn().Int("rule_index", i).Msg("Skipping rule with empty key in policy file.")
 			continue
 		}
-
-		keyToCheck := rule.Key
-		if isLowercase {
-			keyToCheck = strings.ToLower(rule.Key)
-		}
-
-		currentValue, tagExists := tags[keyToCheck]
-
-		// Prepare allowed values list, considering lowercase flag
-		var allowedValuesForCheck []string
-		hasValueRestriction := len(rule.Value) > 0
-		if hasValueRestriction {
-			if isLowercase {
-				for _, v := range rule.Value {
-					allowedValuesForCheck = append(allowedValuesForCheck, strings.ToLower(v))
-				}
-			} else {
-				allowedValuesForCheck = rule.Value
-			}
-		}
-
-		// --- Mandatory Check ---
-		if rule.Mandatory {
-			if !tagExists {
-				issues = append(issues, ValidationIssue{
-					IssueType:      "MissingMandatory",
-					TagKey:         rule.Key, // Report original key from policy
-					Recommendation: nil,      // Set to nil, AI will populate later if needed
-				})
-			} else if hasValueRestriction {
-				// Mandatory tag exists, check value if restricted
-				isValueAllowed := false
-				for _, allowed := range allowedValuesForCheck {
-					if currentValue == allowed {
-						isValueAllowed = true
-						break
-					}
-				}
-				if !isValueAllowed {
-					issues = append(issues, ValidationIssue{
-						IssueType:      "InvalidValue",
-						TagKey:         rule.Key,     // Report original key
-						TagValue:       currentValue, // Report actual value
-						AllowedValues:  rule.Value,   // Report original allowed values
-						Recommendation: nil,          // Set to nil, AI will populate later if needed
-					})
-				}
-			}
+		rule.Status = strings.ToLower(strings.TrimSpace(rule.Status))
+		if rule.Status == "active" {
+			activeRules = append(activeRules, rule)
+			log.Trace().Str("key", rule.Key).Msg("Loaded active policy rule")
 		} else {
-			// --- Optional/Desirable Check ---
-			if tagExists && hasValueRestriction {
-				// Optional tag exists, check value if restricted
-				isValueAllowed := false
-				for _, allowed := range allowedValuesForCheck {
-					if currentValue == allowed {
-						isValueAllowed = true
+			log.Trace().Str("key", rule.Key).Str("status", rule.Status).Msg("Skipping inactive policy rule")
+		}
+	}
+
+	policy := &TagPolicy{Rules: activeRules}
+	log.Debug().Int("active_rules", len(policy.Rules)).Str("file", filename).Msg("Successfully loaded and processed policy file")
+	return policy, nil
+}
+
+// ValidateResource validates a resource's tags against the policy.
+// Takes lowercase flag into account for case-insensitive matching.
+func ValidateResource(kind, name, region string, tags map[string]string, policy *TagPolicy, handleLowercase bool) []ValidationIssue {
+	issues := []ValidationIssue{}
+	// Policy is guaranteed non-nil by LoadPolicy, but check rules just in case
+	if policy == nil || len(policy.Rules) == 0 {
+		log.Trace().Str("kind", kind).Str("name", name).Msg("Skipping validation, no active policy rules.")
+		return issues // No policy or no rules, no issues
+	}
+
+	// Prepare tags for comparison (lowercase if needed)
+	compareTags := tags
+	originalTags := tags // Keep original tags for reporting values
+	if handleLowercase {
+		compareTags = make(map[string]string, len(tags))
+		for k, v := range tags {
+			compareTags[strings.ToLower(k)] = strings.ToLower(v)
+		}
+	}
+
+	// Keep track of keys checked to find missing desirable tags later
+	checkedKeys := make(map[string]bool)
+
+	for _, rule := range policy.Rules {
+		// Use original rule key for reporting, comparison key for checking
+		originalRuleKey := rule.Key
+		compareRuleKey := originalRuleKey
+		if handleLowercase {
+			compareRuleKey = strings.ToLower(originalRuleKey)
+		}
+		checkedKeys[compareRuleKey] = true // Mark this rule key as checked
+
+		tagValue, exists := compareTags[compareRuleKey]
+		originalTagValue := originalTags[originalRuleKey] // Get original value for reporting if exists
+
+		if rule.Mandatory {
+			if !exists {
+				issues = append(issues, ValidationIssue{
+					IssueType: "MissingMandatory",
+					TagKey:    originalRuleKey, // Report original key from policy
+				})
+				log.Trace().Str("kind", kind).Str("name", name).Str("key", originalRuleKey).Msg("Missing mandatory tag")
+			} else if len(rule.Value) > 0 { // Mandatory and has value restrictions
+				isValidValue := false
+				for _, allowedValue := range rule.Value {
+					compareAllowedValue := allowedValue
+					if handleLowercase {
+						compareAllowedValue = strings.ToLower(allowedValue)
+					}
+					if tagValue == compareAllowedValue {
+						isValidValue = true
 						break
 					}
 				}
-				if !isValueAllowed {
+				if !isValidValue {
 					issues = append(issues, ValidationIssue{
-						IssueType:      "InvalidValue",
-						TagKey:         rule.Key,     // Report original key
-						TagValue:       currentValue, // Report actual value
-						AllowedValues:  rule.Value,   // Report original allowed values
-						Recommendation: nil,          // Set to nil, AI will populate later if needed
+						IssueType:     "InvalidValue",
+						TagKey:        originalRuleKey,  // Report original key
+						TagValue:      originalTagValue, // Report original value
+						AllowedValues: rule.Value,       // Report original allowed values
 					})
+					log.Trace().Str("kind", kind).Str("name", name).Str("key", originalRuleKey).Str("value", originalTagValue).Msg("Invalid value for mandatory tag")
 				}
-			} else if !tagExists && !hasValueRestriction {
-				// Optional tag does not exist AND has no value restriction -> treat as desirable
-				issues = append(issues, ValidationIssue{
-					IssueType:      "MissingDesirable",
-					TagKey:         rule.Key, // Report original key
-					Recommendation: nil,      // Set to nil, AI will populate later if needed
-				})
+			}
+		} else { // Not mandatory (Optional/Desirable)
+			if exists && len(rule.Value) > 0 { // Optional tag exists, check value if restricted
+				isValidValue := false
+				for _, allowedValue := range rule.Value {
+					compareAllowedValue := allowedValue
+					if handleLowercase {
+						compareAllowedValue = strings.ToLower(allowedValue)
+					}
+					if tagValue == compareAllowedValue {
+						isValidValue = true
+						break
+					}
+				}
+				if !isValidValue {
+					issues = append(issues, ValidationIssue{
+						IssueType:     "InvalidValue",
+						TagKey:        originalRuleKey,
+						TagValue:      originalTagValue,
+						AllowedValues: rule.Value,
+					})
+					log.Trace().Str("kind", kind).Str("name", name).Str("key", originalRuleKey).Str("value", originalTagValue).Msg("Invalid value for optional tag")
+				}
+			}
+			// We don't add "MissingDesirable" here yet, handle at the end
+		}
+	}
+
+	// Check for missing desirable tags (non-mandatory rules that weren't present)
+	for _, rule := range policy.Rules {
+		if !rule.Mandatory {
+			originalRuleKey := rule.Key
+			compareRuleKey := originalRuleKey
+			if handleLowercase {
+				compareRuleKey = strings.ToLower(originalRuleKey)
+			}
+			if _, exists := compareTags[compareRuleKey]; !exists {
+				// Check if we already added an InvalidValue issue for this key (shouldn't happen, but safety check)
+				alreadyReported := false
+				for _, issue := range issues {
+					// Compare against the original key used in reporting
+					if issue.TagKey == originalRuleKey {
+						alreadyReported = true
+						break
+					}
+				}
+				if !alreadyReported {
+					issues = append(issues, ValidationIssue{
+						IssueType: "MissingDesirable",
+						TagKey:    originalRuleKey,
+					})
+					log.Trace().Str("kind", kind).Str("name", name).Str("key", originalRuleKey).Msg("Missing desirable tag")
+				}
 			}
 		}
 	}

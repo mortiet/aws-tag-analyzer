@@ -1,23 +1,23 @@
 package main
 
 import (
-	"bufio" // For interactive prompt
+	"bufio"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
-	"strconv" // For parsing user choice
+	"strconv"
 	"strings"
 	"time"
 
-	"aws-resource-lister/internal/ai"
-	"aws-resource-lister/internal/aws"
-	"aws-resource-lister/internal/config"
-	"aws-resource-lister/internal/policy"
-	"aws-resource-lister/internal/recommendation" // New package
+	"aws-tag-analyzer/internal/ai"
+	"aws-tag-analyzer/internal/aws"
+	"aws-tag-analyzer/internal/config"
+	"aws-tag-analyzer/internal/policy"
+	"aws-tag-analyzer/internal/recommendation"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/spf13/cobra"
 )
 
 // ResourceInfo defines the structure for JSON output
@@ -26,7 +26,7 @@ type ResourceInfo struct {
 	Name   string                   `json:"name"`
 	Region string                   `json:"region"`
 	Tags   map[string]string        `json:"tags"`
-	Issues []policy.ValidationIssue `json:"issues,omitempty"` // Issues now contain recommendations
+	Issues []policy.ValidationIssue `json:"issues,omitempty"`
 }
 
 // Helper function to convert tags map to lowercase
@@ -38,103 +38,153 @@ func lowercaseTags(tags map[string]string) map[string]string {
 	return lowerTags
 }
 
-// Global flags
+// Application version
+var version = "0.1.0"
+
+// Global variables to hold flag values (populated by Cobra)
 var (
-	logLevelFlag = flag.String("log-level", "info", "Set log level (trace, debug, info, warn, error, fatal, panic)")
+	logLevel   string
+	cfg        *config.Config
+	region     string
+	lowercase  bool
+	policyFile string
+	aiModel    string
+	aiTimeout  time.Duration
+	inputJson  string
+	inputFile  string
+	applyKinds string
 )
 
-func main() {
-	// Parse global flags first
-	flag.Parse()
-
-	// Configure zerolog for console output to stderr
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-	// Set global log level based on the flag
-	level, err := zerolog.ParseLevel(*logLevelFlag)
-	if err != nil {
-		log.Warn().Str("level", *logLevelFlag).Msg("Invalid log level specified, defaulting to 'info'")
-		level = zerolog.InfoLevel
-	}
-	zerolog.SetGlobalLevel(level) // Set level from flag
-
-	log.Info().Str("level", level.String()).Msg("Log level set") // Log the effective level
-
-	// Determine subcommand
-	command := "analyze" // Default command changed to analyze
-	if flag.NArg() > 0 {
-		command = flag.Arg(0)
-	}
-
-	// Load base configuration (needed by both commands for credentials)
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to load .env file. Relying on environment variables or IAM role.")
-		cfg = &config.Config{ // Initialize empty config if .env fails but env vars might exist
-			AWSRegion:          config.GetEnv("AWS_REGION", ""),
-			AWSAccessKeyID:     config.GetEnv("AWS_ACCESS_KEY_ID", ""),
-			AWSSecretAccessKey: config.GetEnv("AWS_SECRET_ACCESS_KEY", ""),
-			AIAPIURL:           config.GetEnv("AI_API_URL", ""),
-			AIAPIToken:         config.GetEnv("AI_API_TOKEN", ""),
+// rootCmd represents the base command when called without any subcommands
+var rootCmd = &cobra.Command{
+	Use:   "aws-tag-analyzer",
+	Short: "AWS Resource Lister and Tag Analyzer",
+	Long: `A tool to list AWS resources, validate their tags against a policy,
+and optionally get AI-powered recommendations for fixing tag issues.
+It can also apply these recommendations interactively.`,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Configure zerolog for console output to stderr
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+		// Set global log level based on the flag
+		level, err := zerolog.ParseLevel(logLevel)
+		if err != nil {
+			log.Warn().Str("level", logLevel).Msg("Invalid log level specified, defaulting to 'info'")
+			level = zerolog.InfoLevel
 		}
-	}
+		zerolog.SetGlobalLevel(level)
+		log.Info().Str("level", level.String()).Msg("Log level set")
 
-	// Execute command
-	switch command {
-	case "analyze": // Renamed from list
-		// Define flags specific to the analyze command
-		analyzeFlags := flag.NewFlagSet("analyze", flag.ExitOnError) // Renamed from listFlags
-		regionFlag := analyzeFlags.String("region", "", "Comma-separated list of AWS regions to target (overrides environment/config file)")
-		lowercaseFlag := analyzeFlags.Bool("lowercase", false, "Convert all output strings (kind, name, region, tags) to lowercase")
-		policyFileFlag := analyzeFlags.String("policy", "", "Path to the tag policy JSON file")
-		aiModelFlag := analyzeFlags.String("ai-model", "", "Enable AI recommendations using the specified model name (e.g., 'deepseek-r1:1.5b'). Requires AI_API_URL and AI_API_TOKEN env vars.") // Updated description, default empty
-		aiTimeoutFlag := analyzeFlags.Duration("ai-timeout", 20*time.Second, "Timeout duration for AI API requests (e.g., 30s, 1m)")
-		inputJsonFlag := analyzeFlags.String("input-json", "", "Path to a JSON file containing pre-fetched resource data (skips AWS fetching)")
+		// Load base configuration if not the version command
+		if cmd.Name() != "version" {
+			cfg, err = config.LoadConfig()
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to load .env file. Relying on environment variables or IAM role.")
+				cfg = &config.Config{
+					AWSRegion:          config.GetEnv("AWS_REGION", ""),
+					AWSAccessKeyID:     config.GetEnv("AWS_ACCESS_KEY_ID", ""),
+					AWSSecretAccessKey: config.GetEnv("AWS_SECRET_ACCESS_KEY", ""),
+					AIAPIURL:           config.GetEnv("AI_API_URL", ""),
+					AIAPIToken:         config.GetEnv("AI_API_TOKEN", ""),
+				}
+			}
+		}
+		return nil
+	},
+}
 
-		// Parse arguments after the command name
-		analyzeFlags.Parse(flag.Args()[1:]) // Renamed from listFlags
+// analyzeCmd represents the analyze command
+var analyzeCmd = &cobra.Command{
+	Use:   "analyze",
+	Short: "Analyze AWS resources for tag policy compliance and get recommendations",
+	Long: `Fetches AWS resources (EC2, S3, etc.), validates their tags against a
+specified policy file, and optionally uses an AI model to suggest fixes for
+non-compliant tags. Outputs results as JSON. Can also read resource data from
+a JSON file instead of fetching from AWS.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		runAnalyzeCommand()
+	},
+}
 
-		runAnalyzeCommand(cfg, regionFlag, lowercaseFlag, policyFileFlag, aiModelFlag, aiTimeoutFlag, inputJsonFlag) // Pass aiModelFlag directly
-	case "apply":
-		// Define flags specific to the apply command
-		applyFlags := flag.NewFlagSet("apply", flag.ExitOnError)
-		inputFlag := applyFlags.String("input", "", "Path to the JSON file containing resources and recommendations (required)")
-		kindFlag := applyFlags.String("kind", "", "Comma-separated list of resource kinds to apply changes to (e.g., ec2,s3). If empty, applies to all.") // Updated description
-
-		// Parse arguments after the command name
-		applyFlags.Parse(flag.Args()[1:])
-
-		if *inputFlag == "" {
+// applyCmd represents the apply command
+var applyCmd = &cobra.Command{
+	Use:   "apply",
+	Short: "Interactively apply tag recommendations from an analysis JSON file",
+	Long: `Reads a JSON file generated by the 'analyze' command and interactively
+prompts the user to apply the recommended tag changes to the corresponding
+AWS resources.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		if inputFile == "" {
 			log.Fatal().Msg("-input flag is required for the apply command")
 		}
+		runApplyCommand()
+	},
+}
 
-		runApplyCommand(cfg, inputFlag, kindFlag) // Pass kindFlag
-	default:
-		log.Fatal().Str("command", command).Msg("Unknown command. Available commands: analyze, apply") // Updated error message
+// versionCmd represents the version command
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print the version number",
+	Run: func(cmd *cobra.Command, args []string) {
+		runVersionCommand()
+	},
+}
+
+// Execute adds all child commands to the root command and sets flags appropriately.
+func Execute() {
+	err := rootCmd.Execute()
+	if err != nil {
+		os.Exit(1)
 	}
 }
 
-// runAnalyzeCommand contains the logic previously in main for listing/analyzing resources.
-func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bool, policyFileFlag *string, aiModelFlag *string, aiTimeoutFlag *time.Duration, inputJsonFlag *string) { // aiRecommendationsFlag removed
-	log.Info().Msg("Running analyze command...") // Updated log message
+func init() {
+	// Add global persistent flags (available to all commands)
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Set log level (trace, debug, info, warn, error, fatal, panic)")
 
-	// Determine if AI recommendations are enabled based on aiModelFlag
-	aiRecommendationsEnabled := *aiModelFlag != ""
+	// Add subcommands to root command
+	rootCmd.AddCommand(analyzeCmd)
+	rootCmd.AddCommand(applyCmd)
+	rootCmd.AddCommand(versionCmd)
+
+	// --- analyzeCmd Flags ---
+	analyzeCmd.Flags().StringVarP(&region, "region", "r", "", "Comma-separated list of AWS regions (overrides env/config)")
+	analyzeCmd.Flags().BoolVarP(&lowercase, "lowercase", "l", false, "Convert output strings (kind, name, region, tags) to lowercase")
+	analyzeCmd.Flags().StringVarP(&policyFile, "policy", "p", "", "Path to the tag policy JSON file (required)")
+	analyzeCmd.Flags().StringVar(&aiModel, "ai-model", "", "Enable AI recommendations using the specified model name (e.g., 'gpt-4')")
+	analyzeCmd.Flags().DurationVar(&aiTimeout, "ai-timeout", 20*time.Second, "Timeout duration for AI API requests")
+	analyzeCmd.Flags().StringVar(&inputJson, "input-json", "", "Path to JSON file with pre-fetched resources (skips AWS fetch)")
+
+	// --- applyCmd Flags ---
+	applyCmd.Flags().StringVarP(&inputFile, "input", "i", "", "Path to the JSON file with resources and recommendations (required)")
+	applyCmd.Flags().StringVarP(&applyKinds, "kind", "k", "", "Comma-separated list of resource kinds to apply changes to (e.g., ec2,s3)")
+}
+
+func main() {
+	Execute()
+}
+
+// runAnalyzeCommand now uses global variables populated by Cobra.
+func runAnalyzeCommand() {
+	log.Info().Msg("Running analyze command...")
+
+	// Determine if AI recommendations are enabled based on aiModel flag
+	aiRecommendationsEnabled := aiModel != ""
 
 	// Validate AI config if enabled
 	if aiRecommendationsEnabled {
 		if cfg.AIAPIURL == "" {
-			log.Fatal().Msg("AI recommendations enabled via -ai-model, but AI_API_URL environment variable is not set.")
+			log.Fatal().Msg("AI recommendations enabled via --ai-model, but AI_API_URL environment variable is not set.")
 		}
 		if cfg.AIAPIToken == "" {
-			log.Fatal().Msg("AI recommendations enabled via -ai-model, but AI_API_TOKEN environment variable is not set.")
+			log.Fatal().Msg("AI recommendations enabled via --ai-model, but AI_API_TOKEN environment variable is not set.")
 		}
-		log.Info().Str("url", cfg.AIAPIURL).Str("model", *aiModelFlag).Msg("AI Recommendations enabled")
+		log.Info().Str("url", cfg.AIAPIURL).Str("model", aiModel).Msg("AI Recommendations enabled")
 	} else {
-		log.Info().Msg("AI Recommendations disabled (no model specified via -ai-model)")
+		log.Info().Msg("AI Recommendations disabled (no model specified via --ai-model)")
 	}
 
 	// Load Tag Policy
-	tagPolicy, err := policy.LoadPolicy(*policyFileFlag)
+	tagPolicy, err := policy.LoadPolicy(policyFile)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to load tag policy")
 	}
@@ -143,18 +193,18 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 	var allResources []ResourceInfo
 
 	// --- Check if reading from input JSON or fetching from AWS ---
-	if *inputJsonFlag != "" {
-		log.Info().Str("file", *inputJsonFlag).Msg("Reading resource data from input JSON file, skipping AWS fetch.")
-		jsonData, err := os.ReadFile(*inputJsonFlag)
+	if inputJson != "" {
+		log.Info().Str("file", inputJson).Msg("Reading resource data from input JSON file, skipping AWS fetch.")
+		jsonData, err := os.ReadFile(inputJson)
 		if err != nil {
-			log.Fatal().Err(err).Str("file", *inputJsonFlag).Msg("Failed to read input JSON file")
+			log.Fatal().Err(err).Str("file", inputJson).Msg("Failed to read input JSON file")
 		}
 
 		err = json.Unmarshal(jsonData, &allResources)
 		if err != nil {
-			log.Fatal().Err(err).Str("file", *inputJsonFlag).Msg("Failed to unmarshal JSON data from input file")
+			log.Fatal().Err(err).Str("file", inputJson).Msg("Failed to unmarshal JSON data from input file")
 		}
-		log.Info().Int("count", len(allResources)).Str("file", *inputJsonFlag).Msg("Successfully loaded resources from JSON file")
+		log.Info().Int("count", len(allResources)).Str("file", inputJson).Msg("Successfully loaded resources from JSON file")
 
 	} else {
 		log.Info().Msg("Fetching resource data from AWS.")
@@ -162,21 +212,21 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 
 		// Determine target regions (only needed if fetching from AWS)
 		var targetRegions []string
-		if *regionFlag != "" {
-			targetRegions = strings.Split(*regionFlag, ",")
-			log.Info().Strs("regions", targetRegions).Msg("Using regions from -region flag")
+		if region != "" {
+			targetRegions = strings.Split(region, ",")
+			log.Info().Strs("regions", targetRegions).Msg("Using regions from --region flag")
 		} else if cfg.AWSRegion != "" {
 			targetRegions = []string{cfg.AWSRegion}
 			log.Info().Str("region", cfg.AWSRegion).Msg("Using region from environment/config")
 		} else {
-			log.Fatal().Msg("AWS region must be set via -region flag, AWS_REGION environment variable, or in .env file when not using -input-json.")
+			log.Fatal().Msg("AWS region must be set via --region flag, AWS_REGION environment variable, or in .env file when not using --input-json.")
 		}
 
 		// --- Resource Fetching Loops ---
 		for _, currentRegion := range targetRegions {
-			currentRegion = strings.TrimSpace(currentRegion) // Clean up spaces
+			currentRegion = strings.TrimSpace(currentRegion)
 			if currentRegion == "" {
-				continue // Skip empty region strings
+				continue
 			}
 
 			log.Info().Str("region", currentRegion).Msg("Processing region")
@@ -201,21 +251,21 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "ec2"
 						name := *instance.InstanceId
 						region := currentRegion
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
-						resInfo := ResourceInfo{ // Create struct but don't add AI recs yet
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
+						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
 							Region: region,
 							Tags:   tags,
 							Issues: issues,
 						}
-						allResources = append(allResources, resInfo) // Add to the main slice
+						allResources = append(allResources, resInfo)
 					}
 				}
 			}
@@ -233,13 +283,13 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "ebs"
 						name := *volume.VolumeId
 						region := currentRegion
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
 						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
@@ -265,13 +315,13 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "vpc"
 						name := *vpc.VpcId
 						region := currentRegion
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
 						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
@@ -297,13 +347,13 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "natgateway"
 						name := *ngw.NatGatewayId
 						region := currentRegion
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
 						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
@@ -329,13 +379,13 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "internetgateway"
 						name := *igw.InternetGatewayId
 						region := currentRegion
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
 						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
@@ -361,13 +411,13 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "eip"
 						name := *ip.AllocationId
 						region := currentRegion
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
 						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
@@ -398,13 +448,13 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "elbv2"
 						name := *lb.LoadBalancerArn
 						region := currentRegion
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
 						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
@@ -430,13 +480,13 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "ecscluster"
 						name := *cluster.ClusterArn
 						region := currentRegion
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
 						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
@@ -453,8 +503,7 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 
 		// --- S3 Buckets ---
 		log.Info().Msg("Fetching S3 Buckets (Global List)...")
-		// Use a client from the first valid region for the initial global list call
-		primaryRegion := targetRegions[0] // Simplified: assumes at least one valid region if we got here
+		primaryRegion := targetRegions[0]
 		for _, r := range targetRegions {
 			if strings.TrimSpace(r) != "" {
 				primaryRegion = strings.TrimSpace(r)
@@ -471,10 +520,8 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 				log.Error().Err(err).Msg("Failed to list S3 buckets")
 			} else {
 				log.Info().Int("count", len(bucketInfos)).Msg("Fetched S3 Bucket list. Now fetching tags...")
-				// Fetch tags for each bucket - GetS3BucketTags handles regional clients internally
 				for _, bucketInfo := range bucketInfos {
 					if bucketInfo.Name != nil {
-						// Use the same s3Client, GetS3BucketTags will get/create the correct regional client
 						tags, err := s3Client.GetS3BucketTags(bucketInfo.Name, bucketInfo.Region)
 						if err != nil {
 							log.Warn().Str("bucket", *bucketInfo.Name).Str("region", bucketInfo.Region).Msg("Using empty tags for bucket due to previous error")
@@ -483,21 +530,21 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						kind := "s3"
 						name := *bucketInfo.Name
 						region := bucketInfo.Region
-						if *lowercaseFlag {
+						if lowercase {
 							kind = strings.ToLower(kind)
 							name = strings.ToLower(name)
 							region = strings.ToLower(region)
 							tags = lowercaseTags(tags)
 						}
-						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, *lowercaseFlag)
-						resInfo := ResourceInfo{ // Create struct but don't add AI recs yet
+						issues := policy.ValidateResource(kind, name, region, tags, tagPolicy, lowercase)
+						resInfo := ResourceInfo{
 							Kind:   kind,
 							Name:   name,
 							Region: region,
 							Tags:   tags,
 							Issues: issues,
 						}
-						allResources = append(allResources, resInfo) // Add to the main slice
+						allResources = append(allResources, resInfo)
 					}
 				}
 				log.Info().Msg("Finished fetching S3 tags.")
@@ -509,8 +556,8 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 
 	// --- Prepare Good Examples for AI ---
 	var goodExamples []ai.ResourceExample
-	const maxExamples = 3         // Limit the number of examples passed to the AI
-	if aiRecommendationsEnabled { // Check the derived boolean
+	const maxExamples = 3
+	if aiRecommendationsEnabled {
 		log.Debug().Msg("Searching for well-tagged resource examples...")
 		count := 0
 		for _, res := range allResources {
@@ -525,7 +572,7 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 				log.Trace().Str("kind", res.Kind).Str("name", res.Name).Msg("Found good example resource")
 			}
 			if count >= maxExamples {
-				break // Stop once we have enough examples
+				break
 			}
 		}
 		log.Debug().Int("count", len(goodExamples)).Msg("Collected well-tagged examples for AI context")
@@ -533,21 +580,18 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 	// --- End Prepare Good Examples ---
 
 	// --- Process AI Recommendations (if enabled) ---
-	if aiRecommendationsEnabled { // Check the derived boolean
-		log.Info().Dur("timeout", *aiTimeoutFlag).Msg("Fetching AI recommendations sequentially for resources with issues...")
+	if aiRecommendationsEnabled {
+		log.Info().Dur("timeout", aiTimeout).Msg("Fetching AI recommendations sequentially for resources with issues...")
 		totalIssues := 0
 		processedIssues := 0
-		// Iterate through all collected resources
 		for i := range allResources {
-			res := &allResources[i] // Get pointer to modify the slice element
+			res := &allResources[i]
 			if len(res.Issues) > 0 {
 				log.Info().Str("kind", res.Kind).Str("name", res.Name).Int("issue_count", len(res.Issues)).Msg("Processing issues for resource")
-				// Iterate through each issue for the current resource
 				for j := range res.Issues {
-					issue := &res.Issues[j] // Get pointer to modify the slice element
+					issue := &res.Issues[j]
 					totalIssues++
 
-					// Log before sending request
 					log.Debug().
 						Str("kind", res.Kind).
 						Str("name", res.Name).
@@ -555,75 +599,68 @@ func runAnalyzeCommand(cfg *config.Config, regionFlag *string, lowercaseFlag *bo
 						Str("tag_key", issue.TagKey).
 						Msg("Querying AI for recommendation")
 
-					recommendationStr, err := ai.GetAIRecommendation( // Renamed variable
+					recommendationStr, err := ai.GetAIRecommendation(
 						cfg.AIAPIURL,
 						cfg.AIAPIToken,
-						*aiModelFlag, // Use the model name directly
+						aiModel,
 						res.Kind,
 						res.Name,
 						res.Region,
 						res.Tags,
 						*issue,
 						goodExamples,
-						*aiTimeoutFlag,
+						aiTimeout,
 					)
 
 					processedIssues++
 					if err != nil {
-						// Log error response
 						log.Warn().Err(err).
 							Str("kind", res.Kind).
 							Str("name", res.Name).
 							Str("issue_type", issue.IssueType).
 							Str("tag_key", issue.TagKey).
 							Msg("Failed to get AI recommendation")
-						// Recommendation field remains nil/empty
 					} else {
-						// Log successful response
 						log.Debug().
 							Str("kind", res.Kind).
 							Str("name", res.Name).
 							Str("issue_type", issue.IssueType).
 							Str("tag_key", issue.TagKey).
-							Str("recommendation", recommendationStr). // Log the received recommendation string
-							Str("model", *aiModelFlag).
+							Str("recommendation", recommendationStr).
+							Str("model", aiModel).
 							Msg("Received AI recommendation")
-						// Assign recommendation as a map with model name as key
 						issue.Recommendation = map[string]string{
-							*aiModelFlag: recommendationStr, // Use the model name directly
+							aiModel: recommendationStr,
 						}
 					}
-				} // End issue loop
+				}
 			}
-		} // End resource loop
+		}
 		log.Info().Int("processed_issues", processedIssues).Int("total_issues", totalIssues).Msg("Finished fetching AI recommendations.")
 	}
 	// --- End AI Processing ---
 
 	log.Info().Msg("Marshalling results to JSON...")
-	// Marshal the collected resources (now potentially with AI recommendations) into JSON
 	jsonData, err := json.MarshalIndent(allResources, "", "  ")
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to marshal resources to JSON")
 	}
 
-	// Print the JSON output to stdout
 	fmt.Println(string(jsonData))
 
-	// Log the total count of processed resources to stderr
 	log.Info().Int("totalResources", len(allResources)).Msg("Processing complete.")
 }
 
-// runApplyCommand handles the logic for applying recommended tags.
-func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { // Add kindFlag parameter
-	log.Info().Str("file", *inputFlag).Msg("Running apply command...")
+// runApplyCommand now uses global variables populated by Cobra.
+func runApplyCommand() {
+	log.Info().Str("file", inputFile).Msg("Running apply command...")
 
 	// Process kind flag
 	allowedKinds := make(map[string]bool)
 	filterByKind := false
-	if *kindFlag != "" {
+	if applyKinds != "" {
 		filterByKind = true
-		kinds := strings.Split(*kindFlag, ",")
+		kinds := strings.Split(applyKinds, ",")
 		for _, k := range kinds {
 			trimmedKind := strings.TrimSpace(k)
 			if trimmedKind != "" {
@@ -632,26 +669,26 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 			}
 		}
 		if len(allowedKinds) == 0 {
-			log.Warn().Str("flagValue", *kindFlag).Msg("Kind filter flag was provided but contained no valid kinds after splitting and trimming.")
-			filterByKind = false // Treat as no filter if empty after processing
+			log.Warn().Str("flagValue", applyKinds).Msg("Kind filter flag was provided but contained no valid kinds after splitting and trimming.")
+			filterByKind = false
 		}
 	}
 
 	// Read the input JSON file
-	jsonData, err := os.ReadFile(*inputFlag)
+	jsonData, err := os.ReadFile(inputFile)
 	if err != nil {
-		log.Fatal().Err(err).Str("file", *inputFlag).Msg("Failed to read input JSON file")
+		log.Fatal().Err(err).Str("file", inputFile).Msg("Failed to read input JSON file")
 	}
 
 	// Unmarshal the JSON data
 	var allResources []ResourceInfo
 	err = json.Unmarshal(jsonData, &allResources)
 	if err != nil {
-		log.Fatal().Err(err).Str("file", *inputFlag).Msg("Failed to unmarshal JSON data from input file")
+		log.Fatal().Err(err).Str("file", inputFile).Msg("Failed to unmarshal JSON data from input file")
 	}
 	log.Info().Int("count", len(allResources)).Msg("Successfully loaded resources for application")
 
-	reader := bufio.NewReader(os.Stdin) // For user input
+	reader := bufio.NewReader(os.Stdin)
 
 	appliedCount := 0
 	skippedCount := 0
@@ -663,7 +700,7 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 		if filterByKind {
 			if _, ok := allowedKinds[resource.Kind]; !ok {
 				log.Trace().Str("kind", resource.Kind).Str("name", resource.Name).Msg("Skipping resource due to kind filter")
-				continue // Skip this resource if kind doesn't match the allowed list
+				continue
 			}
 		}
 		// --- End Filter by Kind ---
@@ -679,13 +716,11 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 
 			// --- Display Common Resource Info ---
 			fmt.Printf("Resource: %s %s (%s)\n", resource.Kind, resource.Name, resource.Region)
-			// Display "Name" tag if it exists
 			if nameTag, ok := resource.Tags["Name"]; ok {
 				fmt.Printf("  Name Tag: '%s'\n", nameTag)
-			} else if nameTag, ok := resource.Tags["name"]; ok { // Check lowercase too
+			} else if nameTag, ok := resource.Tags["name"]; ok {
 				fmt.Printf("  Name Tag: '%s'\n", nameTag)
 			}
-			// Display all existing tags
 			fmt.Println("  Existing Tags:")
 			if len(resource.Tags) > 0 {
 				for k, v := range resource.Tags {
@@ -714,22 +749,20 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 					continue
 				}
 
-				// Display current state of the target tag
 				currentValue, exists := resource.Tags[key]
 				if exists {
 					fmt.Printf("  Current value for tag '%s': '%s'\n", key, currentValue)
 				} else {
 					fmt.Printf("  Tag '%s' is currently missing.\n", key)
 				}
-				// Display recommendation
 				fmt.Printf("  Recommendation (%s): %s tag '%s' with value '%s'\n", model, action, key, value)
-				fmt.Print("Apply this change? (y/N/e[dit]): ") // Updated prompt
+				fmt.Print("Apply this change? (y/N/e[dit]): ")
 
 				inputText, _ := reader.ReadString('\n')
 				inputText = strings.TrimSpace(strings.ToLower(inputText))
 
 				applyChange := false
-				editedValue := value // Start with the recommended value
+				editedValue := value
 
 				switch inputText {
 				case "y":
@@ -741,13 +774,13 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 					editedValue = strings.TrimSpace(newValueText)
 					applyChange = true
 					log.Info().Str("action", action).Str("key", key).Str("originalValue", value).Str("newValue", editedValue).Str("kind", resource.Kind).Str("name", resource.Name).Msg("User approved applying edited change")
-				default: // Includes "n" and anything else
+				default:
 					log.Warn().Str("action", action).Str("key", key).Str("value", value).Str("kind", resource.Kind).Str("name", resource.Name).Msg("User skipped applying change")
 					skippedCount++
 				}
 
 				if applyChange {
-					err := applyTagChange(cfg, resource, action, key, editedValue) // Use editedValue
+					err := applyTagChange(cfg, resource, action, key, editedValue)
 					if err != nil {
 						log.Error().Err(err).Msg("Failed to apply tag change")
 						errorCount++
@@ -756,13 +789,12 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 						appliedCount++
 					}
 				}
-				fmt.Println("---") // Separator
+				fmt.Println("---")
 
 			} else {
 				// --- Multiple Recommendations Logic ---
 				log.Debug().Str("kind", resource.Kind).Str("name", resource.Name).Int("count", len(issue.Recommendation)).Msg("Processing multiple recommendations")
 
-				// Determine the target key and display current state
 				var targetKey string
 				var firstRecParsed bool
 				for _, rec := range issue.Recommendation {
@@ -786,7 +818,6 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 
 				fmt.Println("  Multiple recommendations found:")
 
-				// Store recommendations in a slice and display choices
 				type recChoice struct {
 					model string
 					rec   string
@@ -799,21 +830,19 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 					i++
 				}
 
-				fmt.Printf("Enter the number of the recommendation to apply (1-%d), 'e' to edit the chosen value, or anything else to skip: ", len(choices)) // Updated prompt
+				fmt.Printf("Enter the number of the recommendation to apply (1-%d), 'e' to edit the chosen value, or anything else to skip: ", len(choices))
 				inputText, _ := reader.ReadString('\n')
 				inputText = strings.TrimSpace(strings.ToLower(inputText))
 
 				applyChange := false
 				editChoice := false
 				var selectedChoice recChoice
-				var action, key, value, editedValue string // Declare vars needed later
+				var action, key, value, editedValue string
 
 				choiceIndex, err := strconv.Atoi(inputText)
 				if err == nil && choiceIndex >= 1 && choiceIndex <= len(choices) {
-					// Valid numeric choice - potentially apply or edit
 					selectedChoice = choices[choiceIndex-1]
 					log.Info().Str("kind", resource.Kind).Str("name", resource.Name).Int("choice", choiceIndex).Str("model", selectedChoice.model).Str("rec", selectedChoice.rec).Msg("User selected recommendation")
-					// Ask if they want to edit this choice
 					fmt.Printf("Apply recommendation %d ([%s]: %s)? (y/N/e[dit]): ", choiceIndex, selectedChoice.model, selectedChoice.rec)
 					confirmText, _ := reader.ReadString('\n')
 					confirmText = strings.TrimSpace(strings.ToLower(confirmText))
@@ -824,13 +853,11 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 						applyChange = true
 						editChoice = true
 					} else {
-						// Skipped after choosing
 						log.Warn().Str("input", confirmText).Str("kind", resource.Kind).Str("name", resource.Name).Msg("User skipped applying chosen change")
 						skippedCount++
 					}
 
 				} else if inputText == "e" {
-					// User wants to edit, but needs to choose which one first
 					fmt.Printf("Which recommendation number (1-%d) do you want to edit and apply?: ", len(choices))
 					editChoiceText, _ := reader.ReadString('\n')
 					editChoiceText = strings.TrimSpace(editChoiceText)
@@ -845,12 +872,10 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 						skippedCount++
 					}
 				} else {
-					// Invalid initial choice or non-numeric input -> skip
 					log.Warn().Str("input", inputText).Str("kind", resource.Kind).Str("name", resource.Name).Msg("User skipped applying change (invalid initial choice or non-numeric/non-'e' input)")
 					skippedCount++
 				}
 
-				// If a valid choice was made and user wants to apply (potentially after editing)
 				if applyChange {
 					var parseErr error
 					action, key, value, parseErr = recommendation.ParseRecommendation(selectedChoice.rec)
@@ -858,7 +883,7 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 						log.Error().Err(parseErr).Str("recommendation", selectedChoice.rec).Msg("Failed to parse selected recommendation, skipping")
 						errorCount++
 					} else {
-						editedValue = value // Default to recommended value
+						editedValue = value
 						if editChoice {
 							fmt.Printf("Original suggested value for tag '%s': '%s'\n", key, value)
 							fmt.Printf("Enter new value for tag '%s': ", key)
@@ -869,7 +894,7 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 							log.Info().Str("action", action).Str("key", key).Str("value", value).Str("kind", resource.Kind).Str("name", resource.Name).Msg("Applying selected change")
 						}
 
-						applyErr := applyTagChange(cfg, resource, action, key, editedValue) // Use editedValue
+						applyErr := applyTagChange(cfg, resource, action, key, editedValue)
 						if applyErr != nil {
 							log.Error().Err(applyErr).Msg("Failed to apply tag change")
 							errorCount++
@@ -879,7 +904,7 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 						}
 					}
 				}
-				fmt.Println("---") // Separator
+				fmt.Println("---")
 			}
 		}
 	}
@@ -895,10 +920,6 @@ func runApplyCommand(cfg *config.Config, inputFlag *string, kindFlag *string) { 
 func applyTagChange(cfg *config.Config, resource ResourceInfo, action, key, value string) error {
 	log.Debug().Str("kind", resource.Kind).Str("name", resource.Name).Str("region", resource.Region).Msg("Attempting to apply tag")
 
-	// Create AWS client for the specific region of the resource
-	// Note: We might create redundant clients if multiple resources are in the same region,
-	// but client creation is relatively cheap and simplifies logic here.
-	// S3 client creation is handled within the ApplyTagsToS3Bucket function.
 	client, err := aws.NewAWSClient(resource.Region)
 	if err != nil {
 		return fmt.Errorf("failed to create AWS client for region %s: %w", resource.Region, err)
@@ -908,20 +929,19 @@ func applyTagChange(cfg *config.Config, resource ResourceInfo, action, key, valu
 
 	switch resource.Kind {
 	case "ec2", "ebs", "vpc", "natgateway", "internetgateway", "eip":
-		// These resources use EC2:CreateTags
-		// The 'name' field holds the Resource ID for these types
 		return client.ApplyTagsToEC2Resource(resource.Name, tagsToApply)
 	case "elbv2":
-		// The 'name' field holds the ARN for ELBv2
 		return client.ApplyTagsToELBv2Resource(resource.Name, tagsToApply)
 	case "ecscluster":
-		// The 'name' field holds the ARN for ECS Cluster
 		return client.ApplyTagsToECSResource(resource.Name, tagsToApply)
 	case "s3":
-		// The 'name' field holds the bucket name
-		// ApplyTagsToS3Bucket needs the bucket name and region
 		return client.ApplyTagsToS3Bucket(resource.Name, resource.Region, tagsToApply)
 	default:
 		return fmt.Errorf("unsupported resource kind for applying tags: %s", resource.Kind)
 	}
+}
+
+// runVersionCommand prints the application version.
+func runVersionCommand() {
+	fmt.Printf("aws-tag-analyzer version %s\n", version)
 }

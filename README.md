@@ -58,7 +58,9 @@ Lists resources, validates tags, and optionally generates AI recommendations.
 *   `-lowercase`: Convert resource kind, name, region, and all tag keys/values to lowercase in the output.
 *   `-ai-model`: Enable AI recommendations using the specified model name (e.g., `'deepseek-r1:1.5b'`). If this flag is provided with a non-empty value, AI recommendations are enabled. Requires `AI_API_URL` and `AI_API_TOKEN` environment variables to be set. If omitted or empty, AI recommendations are disabled.
 *   `-ai-timeout`: Timeout for AI API requests (e.g., `30s`, `1m`). Default: `20s`. Only relevant if `-ai-model` is specified.
-*   `-input-json`: Path to a JSON file containing pre-fetched resource data (output from a previous `analyze` run). Skips AWS fetching and uses the file data instead. Useful for re-running validation or AI recommendations without hitting AWS APIs again.
+*   `-input-json`: Path to a JSON file containing pre-fetched resource data (output from a previous `analyze` run). Skips AWS fetching and uses the file data instead.
+    *   If `-policy` **is also provided**, the tags in the JSON file will be **re-validated** against the specified policy, overwriting any `issues` present in the input file.
+    *   If `-policy` **is omitted**, any existing `issues` arrays in the input JSON file will be **cleared** before potentially adding new AI recommendations (if `-ai-model` is used). Useful for generating AI recommendations without re-running validation.
 
 **Examples:**
 
@@ -72,9 +74,15 @@ Lists resources, validates tags, and optionally generates AI recommendations.
     ./aws-tag-analyzer -region eu-west-1,eu-west-2 -policy ./policy.json -ai-model "deepseek-r1:1.5b" > resources_with_ai.json
     ```
 
-3.  **Re-run validation and AI on previously fetched data:**
+3.  **Re-run validation and AI on previously fetched data using a new policy:**
     ```bash
     ./aws-tag-analyzer -input-json ./resources.json -policy ./new_policy.json -ai-model "qwen2.5-coder:32b" > resources_revalidated.json
+    ```
+
+4.  **Add AI recommendations to previously fetched data without re-validating:**
+    ```bash
+    # Note: Omitting -policy here clears existing issues from resources.json first
+    ./aws-tag-analyzer -input-json ./resources.json -ai-model "qwen2.5-coder:32b" > resources_with_ai_only.json
     ```
 
 ### `apply` Command

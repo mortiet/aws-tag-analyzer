@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"aws-resource-lister/internal/policy"
+	"aws-tag-analyzer/internal/policy"
 
 	"github.com/rs/zerolog/log"
 )
